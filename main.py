@@ -1,11 +1,14 @@
-# Host PC Python Code
-# 객체 추적 및 추적한 것들의 중점 좌표들 client 에게 보내기
+# 객체 추적 및 추적한 것들의 중점 좌표들을 그려서 해당 프레임과 객체 ID에 따른 중점 좌료들을 웹소캣 서버로 전송
+
 import socket
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from boxmot import DeepOCSORT
 from pathlib import Path
+import websocket
+import json
+import struct
 
 # 서버 설정
 HOST = '0.0.0.0'
@@ -41,7 +44,7 @@ def send_centroids(conn, centroids):
     try:
         if centroids:
             # 중점 좌표 리스트를 문자열로 변환하여 전송 (ID, x, y 형태)
-            message = ','.join([f'{track_id},{cx},{cy}' for track_id, cx, cy in centroids])
+            message = ','.join([f'{item["id"]},{item["cx"]},{item["cy"]}' for item in centroids])
             conn.sendall(message.encode())
             print(f"Sent centroids: {message}")
         else:
@@ -68,7 +71,7 @@ def process_frame(frame):
         x1, y1, x2, y2, track_id, class_id, conf = map(int, track[:7])
         cx = (x1 + x2) // 2  # 중점 x 좌표
         cy = (y1 + y2) // 2  # 중점 y 좌표
-        centroids.append((track_id, cx, cy))  # 중점 좌표에 트랙 ID 포함
+        centroids.append({'id': track_id, 'cx': cx, 'cy': cy})  # ID 포함
 
         # 바운딩 박스 및 ID 표시
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -76,51 +79,93 @@ def process_frame(frame):
                     (0, 255, 0), 2)
     return frame, centroids
 
-def handle_connection(conn):
+def process_and_send_frame(frame, ws):
+    """
+    프레임을 처리하고, 결과를 WebSocket으로 전송합니다.
+    """
+    # 프레임 처리
+    processed_frame, centroids = process_frame(frame)
+
+    # WebSocket으로 데이터 전송
+    try:
+        centroids_json = json.dumps(centroids)
+        centroids_bytes = centroids_json.encode('utf-8')
+        centroid_length = len(centroids_bytes)
+
+        # 프레임을 JPEG로 인코딩
+        _, buffer = cv2.imencode('.jpg', processed_frame)
+        frame_data = buffer.tobytes()
+        frame_length = len(frame_data)
+
+        # 데이터 패킹
+        message = struct.pack('>I', centroid_length) + centroids_bytes + struct.pack('>I', frame_length) + frame_data
+
+        # WebSocket으로 데이터 전송
+        ws.send(message, opcode=websocket.ABNF.OPCODE_BINARY)
+        print("Sent frame and centroids over websocket")
+
+    except Exception as e:
+        print(f"Error sending data over websocket: {e}")
+
+    return processed_frame, centroids
+
+def receive_frame(conn):
+    """
+    소켓으로부터 프레임 데이터를 수신합니다.
+    """
+    # 이미지 데이터 크기 수신
+    length_data = receive_all(conn, 4)
+    if length_data is None:
+        print("No length data received. Exiting.")
+        return None
+    data_length = int.from_bytes(length_data, byteorder='big')
+    print(f"Expected data length: {data_length} bytes")
+
+    # 이미지 데이터 수신
+    img_data = receive_all(conn, data_length)
+    if img_data is None:
+        print("No image data received. Exiting.")
+        return None
+    print(f"Received image data of length: {len(img_data)} bytes")
+
+    # 데이터를 NumPy 배열로 변환 및 이미지 디코딩
+    img_array = np.frombuffer(img_data, dtype=np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        print("Failed to decode image.")
+        return None
+
+    return frame
+
+def handle_connection(conn, ws):
     """클라이언트 연결을 처리하는 함수"""
     with conn:
         print(f"Connected by {conn.getpeername()}")
+
         while True:
             try:
-                # 이미지 데이터 크기 수신
-                length_data = receive_all(conn, 4)
-                if length_data is None:
-                    print("No length data received. Exiting.")
+                frame = receive_frame(conn)
+                if frame is None:
                     break
-                data_length = int.from_bytes(length_data, byteorder='big')
-                print(f"Expected data length: {data_length} bytes")
 
-                # 이미지 데이터 수신
-                img_data = receive_all(conn, data_length)
-                if img_data is None:
-                    print("No image data received. Exiting.")
+                # 프레임 처리 및 WebSocket으로 전송
+                processed_frame, centroids = process_and_send_frame(frame, ws)
+
+                # 클라이언트로 중점 좌표 전송
+                send_centroids(conn, centroids)
+
+                # 이미지 출력
+                cv2.imshow('YOLO + DeepOCSORT Tracking', processed_frame)
+
+                # 'q' 키로 종료
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-                print(f"Received image data of length: {len(img_data)} bytes")
-
-                # 데이터를 NumPy 배열로 변환 및 이미지 디코딩
-                img_array = np.frombuffer(img_data, dtype=np.uint8)
-                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-                if frame is not None:
-                    # 프레임 처리
-                    processed_frame, centroids = process_frame(frame)
-
-                    # 클라이언트로 중점 좌표 전송
-                    send_centroids(conn, centroids)
-
-                    # 이미지 출력
-                    cv2.imshow('YOLO + DeepOCSORT Tracking', processed_frame)
-
-                    # 'q' 키로 종료
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                else:
-                    print("Failed to decode image.")
             except Exception as e:
-                print(f"Error receiving frame: {e}")
+                print(f"Error processing frame: {e}")
                 break
-    # 정리 작업
-    cv2.destroyAllWindows()
+
+    # 소켓 연결 종료
+    conn.close()
 
 def main():
     # TCP/IP 소켓 생성
@@ -129,10 +174,25 @@ def main():
         s.listen(1)
         print(f"Listening on {HOST}:{PORT}...")
 
-        while True:
-            conn, addr = s.accept()
-            print(f"Accepted connection from {addr}")
-            handle_connection(conn)
+        # WebSocket 연결 설정 (프로그램 시작 시 한 번만 연결)
+        try:
+            ws = websocket.create_connection("ws://localhost:7777/test", ping_interval=None)
+            print("WebSocket client connected to ws://localhost:7777/test")
+        except Exception as e:
+            print(f"Error connecting to WebSocket server: {e}")
+            return
+
+        try:
+            while True:
+                conn, addr = s.accept()
+                print(f"Accepted connection from {addr}")
+                handle_connection(conn, ws)
+        except KeyboardInterrupt:
+            print("Server shutting down...")
+        finally:
+            # 프로그램 종료 시 WebSocket 연결 종료
+            ws.close()
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
