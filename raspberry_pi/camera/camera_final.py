@@ -1,3 +1,4 @@
+# Raspberry Pi : camera_final.py
 from picamera2 import Picamera2
 import cv2
 import socket
