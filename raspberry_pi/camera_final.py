@@ -1,4 +1,3 @@
-# Raspberry Pi : camera_final.py
 from picamera2 import Picamera2
 import cv2
 import socket
@@ -9,7 +8,7 @@ picam2 = Picamera2()
 main_config = {"format": "RGB888", "size": (640, 480)}
 camera_config = picam2.create_preview_configuration(main=main_config)
 picam2.configure(camera_config)
-picam2.set_controls({"FrameRate": 30.0})  # Set initial FPS to 30
+picam2.set_controls({"FrameRate": 30.0})  # Set initial FPS to 5
 
 picam2.start()
 
@@ -20,7 +19,7 @@ PORT = 5000  # Match the port number
 def send_frame_via_socket(s, frame):
     try:
         frame = cv2.resize(frame, (640, 480))  # Resize the frame to 640x480
-        encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUAL>
+        encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])[1].tobytes()
 
         # Send the image size information
         frame_size = len(encoded_frame).to_bytes(4, byteorder='big')
@@ -36,7 +35,7 @@ def receive_centroids(s):
             return None
         # Parse the received centroid data
         tokens = data.decode().split(',')
-        if len(tokens) == 3 and tokens[0] == 'None' and tokens[1] == 'None' an>
+        if len(tokens) == 3 and tokens[0] == 'None' and tokens[1] == 'None' and tokens[2] == 'None':
             return None  # No detection case
         centroids = []
         for i in range(0, len(tokens), 3):
@@ -83,7 +82,7 @@ def main():
                         # Display the centroid on the frame as a yellow dot
                         cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
                         # Display the ID near the centroid
-                        cv2.putText(frame, f'ID: {track_id}', (cx + 5, cy + 5)>
+                        cv2.putText(frame, f'ID: {track_id}', (cx + 5, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                     print(f"Received centroids: {centroids}")
                 else:
                     print("No objects detected.")
