@@ -1,5 +1,4 @@
 # 객체 추적 및 추적한 것들의 중점 좌표들을 그려서 해당 프레임과 객체 ID에 따른 중점 좌료들을 웹소캣 서버로 전송
-
 import socket
 import cv2
 import numpy as np
