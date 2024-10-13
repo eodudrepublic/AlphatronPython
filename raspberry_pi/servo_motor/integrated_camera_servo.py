@@ -4,29 +4,11 @@ import cv2
 import socket
 import RPi.GPIO as GPIO
 import time
+from adafruit_servokit import ServoKit
 
 # ================================
-# Servo Motor Setup
+# GPIO and Servo Motor Setup
 # ================================
-
-# GPIO pin numbers where the servo motors are connected
-SERVO_PIN_0 = 12  # PWM0 - GPIO18 (pin number 12)
-SERVO_PIN_1 = 33  # PWM1 - GPIO13 (pin number 33)
-
-# Servo motor duty cycle constants
-SERVO_MAX_DUTY = 11  # Duty cycle corresponding to 180 degrees
-SERVO_MIN_DUTY = 2  # Duty cycle corresponding to 0 degrees
-
-# Set GPIO mode
-GPIO.setmode(GPIO.BOARD)
-GPIO.setup(SERVO_PIN_0, GPIO.OUT)
-GPIO.setup(SERVO_PIN_1, GPIO.OUT)
-
-# Create PWM instances (frequency 50Hz)
-servo0 = GPIO.PWM(SERVO_PIN_0, 50)
-servo1 = GPIO.PWM(SERVO_PIN_1, 50)
-servo0.start(0)  # Start PWM signal with 0% duty cycle
-servo1.start(0)
 
 # Camera field of view
 FRAME_WIDTH = 640
@@ -37,25 +19,73 @@ VFOV = 48.8  # Raspberry Pi Camera Module 3 Wide Vertical FOV in degrees
 FRAME_CENTER_X = FRAME_WIDTH / 2
 FRAME_CENTER_Y = FRAME_HEIGHT / 2
 
+# --- GPIO Mode Configuration ---
+DESIRED_MODE = GPIO.BCM  # Set to BCM to match current mode
 
-def setServoPos(servo, angle):
+# Check the current GPIO mode
+current_mode = GPIO.getmode()
+
+if current_mode is None:
+    GPIO.setmode(DESIRED_MODE)
+    print(f"GPIO mode set to {DESIRED_MODE} (BCM).")
+elif current_mode != DESIRED_MODE:
+    raise ValueError(f"GPIO mode already set to {current_mode}. Cannot set to {DESIRED_MODE}.")
+else:
+    print(f"GPIO mode is already set to {current_mode} (BCM).")
+
+# --- Servo Motor 1 Configuration (GPIO18) ---
+SERVO_PIN = 18  # BCM pin number 18 (BOARD pin number 12)
+SERVO_MIN_DUTY = 2  # Duty cycle for 0 degrees
+SERVO_MAX_DUTY = 11  # Duty cycle for 180 degrees
+
+# Setup GPIO for Servo Motor 1
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+# Initialize PWM for Servo Motor 1 at 50Hz
+servo0 = GPIO.PWM(SERVO_PIN, 50)
+servo0.start(0)  # Start PWM with 0% duty cycle
+
+# --- Servo Motor 2 Configuration (ServoKit) ---
+kit = ServoKit(channels=16, address=0x40)  # Adjust 'address' if necessary
+
+
+def setServoPosGPIO(angle):
     """
-    Moves the servo motor to the specified angle.
+    Moves the servo motor connected to GPIO18 to the specified angle.
 
     Parameters:
-    servo (PWM): The PWM instance of the servo motor to control
     angle (float): The target angle between 0 and 180 degrees
     """
-    # Limit the angle between 0 and 180 degrees
-    angle = 180 - (max(0, min(180, angle)))
+    # Reverse the angle (180 - angle)
+    reversed_angle = 180 - angle
+
+    # Limit the reversed angle between 0 and 180 degrees
+    reversed_angle = max(0, min(180, reversed_angle))
 
     # Calculate the duty cycle
-    duty = SERVO_MIN_DUTY + (angle * (SERVO_MAX_DUTY - SERVO_MIN_DUTY) / 180.0)
+    duty = SERVO_MIN_DUTY + (reversed_angle * (SERVO_MAX_DUTY - SERVO_MIN_DUTY) / 180.0)
 
     # Move the servo motor
-    servo.ChangeDutyCycle(duty)
-    time.sleep(0.03)  # Wait for a short time
-    servo.ChangeDutyCycle(0)  # Reset duty cycle to prevent jitter
+    servo0.ChangeDutyCycle(duty)
+    time.sleep(0.03)
+    servo0.ChangeDutyCycle(0)  # Reset duty cycle to prevent jitter
+
+
+def setServoPosServoKit(angle):
+    """
+    Moves the servo motor connected to ServoKit channel 0 to the specified angle.
+
+    Parameters:
+    angle (float): The target angle between 0 and 180 degrees
+    """
+    # Reverse the angle (180 - angle)
+    reversed_angle = 180 - angle
+
+    # Limit the reversed angle between 0 and 180 degrees
+    reversed_angle = max(0, min(180, reversed_angle))
+
+    # Set the angle for Servo Motor 2 (channel 0)
+    kit.servo[0].angle = reversed_angle
 
 
 # ================================
@@ -112,6 +142,8 @@ def receive_centroids(s):
 
 
 def main():
+    servo0_moved = False
+
     # Establish socket connection
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((HOST, PORT))
@@ -153,12 +185,13 @@ def main():
                     target_servo1_angle = 90.0
 
                 # Only update servo positions if there is a significant change
-                if (prev_servo0_angle is None or abs(target_servo0_angle - prev_servo0_angle) > 1):
-                    setServoPos(servo0, target_servo0_angle)
+                if prev_servo0_angle is None or abs(target_servo0_angle - prev_servo0_angle) > 1:
+                    setServoPosGPIO(target_servo0_angle)
                     prev_servo0_angle = target_servo0_angle
+                    servo0_moved = True
 
-                if (prev_servo1_angle is None or abs(target_servo1_angle - prev_servo1_angle) > 1):
-                    setServoPos(servo1, target_servo1_angle)
+                if prev_servo1_angle is None or abs(target_servo1_angle - prev_servo1_angle) > 1:
+                    setServoPosServoKit(target_servo1_angle)
                     prev_servo1_angle = target_servo1_angle
 
                 # Display the captured frame with centroids
@@ -167,8 +200,12 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-                # Optional: Add a small delay to prevent rapid updates
-                time.sleep(0.05)
+                if servo0_moved:
+                    servo0_moved = False
+                else:
+                    # Optional: Add a small delay to prevent rapid updates
+                    time.sleep(0.03)
+                    servo0_moved = False
 
             except Exception as e:
                 print(f"Error: {e}")
@@ -179,7 +216,6 @@ def main():
     cv2.destroyAllWindows()
     # Clean up GPIO settings
     servo0.stop()
-    servo1.stop()
     GPIO.cleanup()
     print("Connection closed")
 
