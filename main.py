@@ -33,11 +33,20 @@ tracking_method = DeepOCSORT(
 raspberry_pi_conn = None
 raspberry_pi_conn_lock = threading.Lock()
 
-# 중점 좌표 저장소
-centroid_data = {}
+# 현재 프레임의 중점 좌표 저장소
+current_frame_ids = set()
+current_frame_ids_lock = threading.Lock()
 
-# 클라이언트 소켓 저장소
-client_connections = {}
+# 이전 프레임의 중점 좌표 저장소
+previous_centroid_data = {}
+
+# 요청된 타겟 ID
+requested_id = None
+requested_id_lock = threading.Lock()
+
+# 사격 요청 플래그
+shoot_requested = False
+shoot_requested_lock = threading.Lock()
 
 # Flask 서버 생성
 app = Flask(__name__)
@@ -46,16 +55,31 @@ app = Flask(__name__)
 @app.route('/target/<int:target_id>', methods=['POST'])
 def receive_id(target_id):
     """
-    특정 ID의 중점 좌표를 라즈베리파이로 전송하는 엔드포인트
+    특정 ID의 중점 좌표 요청을 처리하는 엔드포인트
     """
-    global raspberry_pi_conn
-    print("Received POST request at /target/<id>")
-    with raspberry_pi_conn_lock:
-        if raspberry_pi_conn and target_id in centroid_data:
-            send_centroid_by_id(raspberry_pi_conn, target_id)
-            return jsonify({"id": target_id, "centroid": centroid_data[target_id]}), 200
+    global requested_id
+    print("Received POST request at /target/id")
+    with requested_id_lock:
+        requested_id = target_id
+    return jsonify({"message": f"Target ID {target_id} received"}), 200
+
+
+@app.route('/shoot/true', methods=['POST'])
+def shoot_request():
+    """
+    사격 요청을 처리하는 엔드포인트
+    """
+    global shoot_requested
+    print("Received POST request at /shoot/true")
+    with current_frame_ids_lock:
+        if current_frame_ids:
+            # 현재 프레임에 ID가 존재하면 사격 요청 성공
+            with shoot_requested_lock:
+                shoot_requested = True  # 다음 ACK에 포함하기 위해 플래그 설정
+            return jsonify({"message": "Shoot request successful"}), 200
         else:
-            return jsonify({"error": "ID not found or Raspberry Pi not connected"}), 404
+            # 현재 프레임에 ID가 없으면 사격 요청 실패
+            return jsonify({"error": "No IDs detected in the current frame"}), 400  # 200 이외의 응답
 
 
 def flask_thread():
@@ -75,26 +99,12 @@ def receive_all(conn, length):
     return data
 
 
-def send_centroid_by_id(conn, target_id):
-    """특정 ID의 중점 좌표를 클라이언트에게 전송"""
-    try:
-        if target_id in centroid_data:
-            # 해당 ID의 중점 좌표 가져오기
-            centroid = centroid_data[target_id]
-            message = f'{target_id},{centroid["cx"]},{centroid["cy"]}'
-            conn.sendall(message.encode())
-            # print(f"Sent centroid for ID {target_id}: {message}")
-        else:
-            print(f"ID {target_id} not found in centroid_data.")
-    except Exception as e:
-        print(f"Error sending centroids: {e}")
-
-
 def process_frame(frame):
     """
     프레임을 처리하여 객체 탐지 및 추적을 수행하고, 중점 좌표를 반환합니다.
     """
-    global centroid_data
+    global previous_centroid_data
+    global current_frame_ids
 
     # YOLOv8n 모델로 객체 탐지 수행
     results = model(frame, classes=[0], verbose=False)  # 클래스 0(person)만 탐지
@@ -104,6 +114,7 @@ def process_frame(frame):
     tracks = tracking_method.update(detections, frame)
 
     centroids = []  # 중점 좌표 리스트
+    current_frame_ids_local = set()  # 현재 프레임의 ID 집합
 
     # 추적된 객체 그리기 및 중점 계산
     for track in tracks:
@@ -112,15 +123,20 @@ def process_frame(frame):
         cy = (y1 + y2) // 2  # 중점 y 좌표
         centroids.append({'id': track_id, 'cx': cx, 'cy': cy})  # 현재 프레임의 중점 좌표 리스트에 추가
 
-        # centroid_data 딕셔너리에 현재 추적된 ID의 중점 좌표 업데이트
-        centroid_data[track_id] = {'cx': cx, 'cy': cy}
+        # 이전 중점 데이터 업데이트
+        previous_centroid_data[track_id] = {'cx': cx, 'cy': cy}
+
+        # 현재 프레임의 ID에 추가
+        current_frame_ids_local.add(track_id)
 
         # 바운딩 박스 및 ID 표시
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                     (0, 255, 0), 2)
 
-    print(centroid_data)
+    # 현재 프레임의 ID를 전역 변수로 업데이트
+    with current_frame_ids_lock:
+        current_frame_ids = current_frame_ids_local
 
     return frame, centroids
 
@@ -185,14 +201,40 @@ def receive_frame(conn):
     return frame
 
 
-def send_ack(conn):
-    """데이터를 받을 시 ACK 데이터를 전송"""
+def send_ack_with_data(conn):
+    """
+    프레임 처리가 완료된 후 Raspberry Pi에 ACK를 전송합니다.
+    요청된 ID의 중점 좌표와 사격 명령을 포함합니다.
+    """
+    global requested_id
+    global shoot_requested
+
+    # 사격 요청 상태 가져오기
+    with shoot_requested_lock:
+        shoot_value = 1 if shoot_requested else 0
+        shoot_requested = False  # ACK에 포함 후 플래그 초기화
+
+    # 요청된 ID와 중점 좌표 가져오기
+    with requested_id_lock:
+        target_id = requested_id
+
+    if target_id is not None:
+        # 요청된 ID가 있을 경우
+        if target_id in previous_centroid_data:
+            centroid = previous_centroid_data[target_id]
+            message = f"{target_id},{centroid['cx']},{centroid['cy']},{shoot_value}"
+        else:
+            # 요청된 ID에 대한 데이터가 없을 경우
+            message = f"None,None,None,{shoot_value}"
+    else:
+        # 요청된 ID가 없을 경우
+        message = f"None,None,None,{shoot_value}"
+
     try:
-        message = "None,None,None"
         conn.sendall(message.encode())
-        # print(f"Sent initial data: {message}")
+        print(f"Sent ACK: {message}")
     except Exception as e:
-        print(f"Error sending initial data: {e}")
+        print(f"Error sending ACK: {e}")
 
 
 def handle_connection(conn, addr, ws):
@@ -211,7 +253,7 @@ def handle_connection(conn, addr, ws):
                 # 프레임 처리 및 WebSocket으로 전송
                 processed_frame, _ = process_and_send_frame(frame, ws)
 
-                send_ack(conn)
+                send_ack_with_data(conn)
 
                 # 이미지 출력
                 cv2.imshow('YOLO + DeepOCSORT Tracking', processed_frame)
@@ -223,10 +265,10 @@ def handle_connection(conn, addr, ws):
                 print(f"Error processing frame: {e}")
                 break
 
-    # 연결이 종료되면 소켓 제거
-    with raspberry_pi_conn_lock:
-        raspberry_pi_conn = None
-    conn.close()
+        # 연결이 종료되면 소켓 제거
+        with raspberry_pi_conn_lock:
+            raspberry_pi_conn = None
+        conn.close()
 
 
 def main():
